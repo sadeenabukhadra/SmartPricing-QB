@@ -1,4 +1,4 @@
-﻿# lastprice.ps1 - "Last sold price per customer" tool for QuickBooks Desktop (Enterprise 11.0)
+# lastprice.ps1 - "Last sold price per customer" tool for QuickBooks Desktop (Enterprise 11.0)
 #
 # What it does:
 #   1. READS Invoices + Sales Receipts (from -FromDate to today), Items, Customers, Price Levels.
