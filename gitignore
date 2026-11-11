@@ -1,0 +1,11 @@
+# Output and data: contain customer prices - never commit
+LastPrice/
+*.csv
+*.xlsx
+*.xls
+*.qbw
+*.qbb
+*.tlg
+*.nd
+lastprice-probe.txt
+*.log
