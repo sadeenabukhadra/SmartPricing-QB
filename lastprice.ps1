@@ -1,4 +1,4 @@
-# lastprice.ps1 - "Last sold price per customer" tool for QuickBooks Desktop (Enterprise 11.0)
+﻿# lastprice.ps1 - "Last sold price per customer" tool for QuickBooks Desktop (Enterprise 11.0)
 #
 # What it does:
 #   1. READS Invoices + Sales Receipts (from -FromDate to today), Items, Customers, Price Levels.
@@ -280,8 +280,8 @@ try {
     # cache for prepare.ps1 (IDs, one row per customer+item) - only on full runs
     if (-not $OnlyCustomer) {
     $cache = foreach ($cp in $custPlan) {
-        if ($cp.Status -ne "OK" -and $cp.Status -notlike "LIST ONLY*") { continue }
-        foreach ($r in $cp.Recs) { if ($items[$r.ItemId].Active) { [pscustomobject]@{ CustId = $cp.Cust.ListID; Customer = $cp.Cust.Name; CurId = $cp.Cust.CurId; Fixed = $(if ($cp.Status -eq "OK") { "YES" } else { "" }); ItemId = $r.ItemId; Item = $items[$r.ItemId].Name; Price = (Fmt $r.Price); DiscPct = (Fmt ($r.Pct * 100)); Date = $r.Date } } }
+        # every customer with sales goes to the cache; prepare.ps1 shows why some are not automatic
+        foreach ($r in $cp.Recs) { if ($items[$r.ItemId].Active) { [pscustomobject]@{ CustId = $cp.Cust.ListID; Customer = $cp.Cust.Name; CurId = $cp.Cust.CurId; Fixed = $(if ($cp.Status -eq "OK") { "YES" } elseif (-not $cp.Cust.Active) { "INACTIVE" } elseif ($cp.Status -like "SKIP: already has price level*") { "OTHER" } else { "" }); OtherLevel = $(if ($cp.Cust.PLName -and -not $cp.Cust.PLName.StartsWith("LP")) { $cp.Cust.PLName } else { "" }); ItemId = $r.ItemId; Item = $items[$r.ItemId].Name; Price = (Fmt $r.Price); DiscPct = (Fmt ($r.Pct * 100)); Date = $r.Date } } }
     }
     try { $cache | Export-Csv -Path (Join-Path $outDir "cache-lastprices.csv") -NoTypeInformation -Encoding UTF8 } catch { Log "WARNING: could not write cache-lastprices.csv" }
     $lookupFile = Join-Path $outDir "last-prices.csv"
