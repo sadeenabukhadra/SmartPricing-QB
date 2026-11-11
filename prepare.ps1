@@ -1,4 +1,4 @@
-﻿# prepare.ps1 - "Prepare customer" button for customers WITHOUT a fixed price level.
+# prepare.ps1 - "Prepare customer" button for customers WITHOUT a fixed price level.
 # The accountant picks a customer -> the tool puts that customer's last prices into one of the
 # rotating price levels ("LPX 01".."LPX 12", least recently used) and links it to the customer.
 # Then a new invoice for that customer auto-fills the last prices (BEFORE discount).
