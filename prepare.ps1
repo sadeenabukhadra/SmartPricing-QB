@@ -1,4 +1,4 @@
-# prepare.ps1 - "Prepare customer" button for customers WITHOUT a fixed price level.
+﻿# prepare.ps1 - "Prepare customer" button for customers WITHOUT a fixed price level.
 # The accountant picks a customer -> the tool puts that customer's last prices into one of the
 # rotating price levels ("LPX 01".."LPX 12", least recently used) and links it to the customer.
 # Then a new invoice for that customer auto-fills the last prices (BEFORE discount).
@@ -25,6 +25,28 @@ function Esc($s) { [Security.SecurityElement]::Escape([string]$s) }
 function T($node, $path) { if (-not $node) { return $null }; $n = $node.SelectSingleNode($path); if ($n) { return $n.InnerText } else { return $null } }
 
 if (-not (Test-Path $cacheFile)) { [Windows.Forms.MessageBox]::Show("Missing $cacheFile`nRun the nightly tool (lastprice) first.", "Last Price") | Out-Null; exit 1 }
+# Search helper: makes Arabic/English names comparable (no case, no tashkeel/tatweel,
+# alef forms -> alef, ta marbuta -> ha, alef maqsura -> ya, hamza on waw/ya -> waw/ya, Arabic digits -> 0-9).
+# Only \u escapes are used so the file works in any encoding.
+$script:AR_ALEF = [string][char]0x0627; $script:AR_HA = [string][char]0x0647; $script:AR_YA = [string][char]0x064A; $script:AR_WAW = [string][char]0x0648
+function Norm($s) {
+    if (-not $s) { return "" }
+    $s = ([string]$s).ToLowerInvariant()
+    $s = $s -replace '[\u064B-\u065F\u0670\u0640]', ''
+    $s = $s -replace '[\u0622\u0623\u0625\u0671]', $script:AR_ALEF
+    $s = $s -replace '\u0629', $script:AR_HA
+    $s = $s -replace '[\u0649\u0626]', $script:AR_YA
+    $s = $s -replace '\u0624', $script:AR_WAW
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $s.ToCharArray()) {
+        $c = [int]$ch
+        if ($c -ge 0x0660 -and $c -le 0x0669) { [void]$sb.Append([char](48 + $c - 0x0660)) }
+        elseif ($c -ge 0x06F0 -and $c -le 0x06F9) { [void]$sb.Append([char](48 + $c - 0x06F0)) }
+        else { [void]$sb.Append($ch) }
+    }
+    return (($sb.ToString() -replace '[\s\-_.,/\\]+', ' ').Trim())
+}
+
 $cache = Import-Csv $cacheFile
 $byCust = @{}; foreach ($r in $cache) { if (-not $byCust.ContainsKey($r.CustId)) { $byCust[$r.CustId] = New-Object System.Collections.ArrayList }; [void]$byCust[$r.CustId].Add($r) }
 $names = $byCust.Keys | ForEach-Object {
@@ -32,7 +54,7 @@ $names = $byCust.Keys | ForEach-Object {
     # last discount = discount on the customer's most recent sale (if the cache has the column)
     $lastRow = $byCust[$_] | Sort-Object { $_.Date } | Select-Object -Last 1
     $d = if ($lastRow.PSObject.Properties["DiscPct"]) { [string]$lastRow.DiscPct } else { "" }
-    [pscustomobject]@{ Id = $_; Name = $r.Customer; Fixed = $r.Fixed; CurId = $r.CurId; Disc = $d; DiscDate = $(if ($lastRow.PSObject.Properties["Date"]) { $lastRow.Date } else { "" }) } } | Sort-Object Name
+    [pscustomobject]@{ Id = $_; Name = $r.Customer; Fixed = $r.Fixed; CurId = $r.CurId; Disc = $d; DiscDate = $(if ($lastRow.PSObject.Properties["Date"]) { $lastRow.Date } else { "" }); Items = $byCust[$_].Count; Key = (Norm $r.Customer); Other = $(if ($r.PSObject.Properties["OtherLevel"]) { $r.OtherLevel } else { "" }) } } | Sort-Object Name
 function DiscText($c) {
     if (-not $c.Disc -or $c.Disc -eq "0") { return "Last discount: none." }
     $memo = "Discount $($c.Disc)%"
@@ -62,7 +84,7 @@ function Prepare-Customer($cust) {
         $me = $all | Where-Object { $_.ListID -eq $cust.Id } | Select-Object -First 1
         if (-not $me) { return "Customer not found in QuickBooks." }
         if ($me.PLName -and $me.PLName.StartsWith("LP ")) { return "'$($me.Name)' already has a fixed price level ($($me.PLName)). Nothing to do - just open the invoice." }
-        if ($me.PLName -and -not $me.PLName.StartsWith("LPX ")) { return "'$($me.Name)' has another price level ($($me.PLName)). Not changed." }
+        if ($me.PLName -and -not $me.PLName.StartsWith("LPX ")) { $ans = [Windows.Forms.MessageBox]::Show($f, "'$($me.Name)' has the price level '$($me.PLName)'.`nReplace it with this customer's last prices?", "Last Price", [Windows.Forms.MessageBoxButtons]::YesNo, [Windows.Forms.MessageBoxIcon]::Question); if ($ans -ne [Windows.Forms.DialogResult]::Yes) { return "'$($me.Name)' keeps its price level ($($me.PLName)). Not changed." }; Log "replacing level '$($me.PLName)' on '$($me.Name)'"; $me.PLName = ""; $me.PLId = "" }
 
         # choose slot: own LPX -> new LPX (if fewer than $Rotating) -> least recently used
         $slot = $null; $slotName = ""
@@ -104,29 +126,67 @@ function Prepare-Customer($cust) {
 }
 
 # ---------- window ----------
+$font = New-Object Drawing.Font("Tahoma", 11)
 $f = New-Object Windows.Forms.Form
-$f.Text = "Last Price - prepare customer"; $f.Size = New-Object Drawing.Size(520, 590); $f.StartPosition = "CenterScreen"; $f.TopMost = $true
-$lbl = New-Object Windows.Forms.Label; $lbl.Text = "Search customer:"; $lbl.Location = "10,10"; $lbl.AutoSize = $true
-$tb = New-Object Windows.Forms.TextBox; $tb.Location = "10,32"; $tb.Width = 480
-$lb = New-Object Windows.Forms.ListBox; $lb.Location = "10,62"; $lb.Size = New-Object Drawing.Size(480, 360)
-$btn = New-Object Windows.Forms.Button; $btn.Text = "Prepare"; $btn.Location = "10,430"; $btn.Width = 120; $btn.Height = 32
-$st = New-Object Windows.Forms.Label; $st.Location = "10,470"; $st.Size = New-Object Drawing.Size(480, 70)
-$f.Controls.AddRange(@($lbl, $tb, $lb, $btn, $st))
-$shown = @()
+$f.Text = "Last Price - prepare customer"; $f.Size = New-Object Drawing.Size(560, 650); $f.StartPosition = "CenterScreen"; $f.TopMost = $true; $f.KeyPreview = $true
+$lbl = New-Object Windows.Forms.Label; $lbl.Text = "Search customer (any part of the name, Arabic or English, words in any order):"; $lbl.Location = "10,10"; $lbl.AutoSize = $true
+$tb = New-Object Windows.Forms.TextBox; $tb.Location = "10,32"; $tb.Width = 420; $tb.Font = $font
+$clr = New-Object Windows.Forms.Button; $clr.Text = "Clear (Esc)"; $clr.Location = "440,31"; $clr.Width = 90; $clr.Height = 28
+$cnt = New-Object Windows.Forms.Label; $cnt.Location = "10,66"; $cnt.AutoSize = $true; $cnt.ForeColor = [Drawing.Color]::DimGray
+$lb = New-Object Windows.Forms.ListBox; $lb.Location = "10,88"; $lb.Size = New-Object Drawing.Size(520, 380); $lb.Font = $font; $lb.IntegralHeight = $false
+$info = New-Object Windows.Forms.Label; $info.Location = "10,474"; $info.Size = New-Object Drawing.Size(520, 22); $info.ForeColor = [Drawing.Color]::Navy
+$btn = New-Object Windows.Forms.Button; $btn.Text = "Prepare (Enter)"; $btn.Location = "10,500"; $btn.Width = 140; $btn.Height = 32
+$st = New-Object Windows.Forms.Label; $st.Location = "10,540"; $st.Size = New-Object Drawing.Size(520, 66)
+$f.Controls.AddRange(@($lbl, $tb, $clr, $cnt, $lb, $info, $btn, $st))
+$script:shown = @()
+
 function Fill() {
-    $q = $tb.Text.Trim().ToLower(); $lb.BeginUpdate(); $lb.Items.Clear()
-    $script:shown = @($names | Where-Object { $q -eq "" -or $_.Name.ToLower().Contains($q) })
-    foreach ($n in $script:shown) { [void]$lb.Items.Add($(if ($n.Fixed -eq "YES") { "$($n.Name)   [automatic]" } else { $n.Name })) }
+    $words = @((Norm $tb.Text).Split(' ') | Where-Object { $_ })
+    $first = @(); $rest = @()
+    foreach ($n in $names) {
+        $ok = $true
+        foreach ($w in $words) { if (-not $n.Key.Contains($w)) { $ok = $false; break } }
+        if (-not $ok) { continue }
+        # names that START with the first word come first
+        if ($words.Count -gt 0 -and $n.Key.StartsWith($words[0])) { $first += $n } else { $rest += $n }
+    }
+    $script:shown = @($first + $rest)
+    $lb.BeginUpdate(); $lb.Items.Clear()
+    foreach ($n in $script:shown) { $tag = switch ($n.Fixed) { "YES" { "   [automatic]" } "OTHER" { "   [has level: $($n.Other)]" } "INACTIVE" { "   [inactive]" } default { "" } }; [void]$lb.Items.Add("$($n.Name)$tag") }
     $lb.EndUpdate()
+    if ($script:shown.Count -gt 0) { $lb.SelectedIndex = 0 } else { $info.Text = "" }
+    $cnt.Text = if ($words.Count -eq 0) { "$($names.Count) customers" } elseif ($script:shown.Count -eq 0) { "No customer matches - try fewer letters or one word." } else { "$($script:shown.Count) of $($names.Count) customers" }
 }
+$lb.Add_SelectedIndexChanged({
+    if ($lb.SelectedIndex -lt 0) { $info.Text = ""; return }
+    $c = $script:shown[$lb.SelectedIndex]
+    $d = if ($c.Disc -and $c.Disc -ne "0") { "last discount $($c.Disc)%" } else { "no discount" }
+    $k = switch ($c.Fixed) { "YES" { "automatic (fixed level)" } "OTHER" { "has price level $($c.Other) - Prepare will ask to replace it" } "INACTIVE" { "INACTIVE customer - needs Prepare" } default { "needs Prepare" } }
+    $info.Text = "$($c.Items) items  |  $d  |  $k"
+})
 $tb.Add_TextChanged({ Fill })
 $go = {
     if ($lb.SelectedIndex -lt 0) { $st.Text = "Pick a customer first."; return }
     $c = $script:shown[$lb.SelectedIndex]
     if ($c.Fixed -eq "YES") { $st.Text = "'$($c.Name)' is automatic already. Just open the invoice.`n" + (DiscText $c); return }
     $st.Text = "Working..."; $f.Refresh()
-    try { $st.Text = (Prepare-Customer $c) + "`n" + (DiscText $c) } catch { $st.Text = "ERROR: $($_.Exception.Message)"; Log "ERROR $($_.Exception.Message)" }
+    try { $st.Text = (Prepare-Customer $c) + "`n" + (DiscText $c); if ($c.Fixed -eq "INACTIVE") { $st.Text += "`nNote: this customer is INACTIVE in QuickBooks - make it active before invoicing." } } catch { $st.Text = "ERROR: $($_.Exception.Message)"; Log "ERROR $($_.Exception.Message)" }
 }
+$clr.Add_Click({ $tb.Text = ""; $tb.Focus() })
+# keyboard: type to search, Up/Down to move in the list, Enter = Prepare, Esc = clear search
+$tb.Add_KeyDown({
+    param($s, $e)
+    if ($e.KeyCode -eq "Down" -and $lb.Items.Count -gt 0) { if ($lb.SelectedIndex -lt $lb.Items.Count - 1) { $lb.SelectedIndex++ }; $e.Handled = $true }
+    elseif ($e.KeyCode -eq "Up" -and $lb.SelectedIndex -gt 0) { $lb.SelectedIndex--; $e.Handled = $true }
+    elseif ($e.KeyCode -eq "Enter") { $e.SuppressKeyPress = $true; & $go }
+    elseif ($e.KeyCode -eq "Escape") { $e.SuppressKeyPress = $true; $tb.Text = "" }
+})
+$lb.Add_KeyDown({
+    param($s, $e)
+    if ($e.KeyCode -eq "Enter") { $e.SuppressKeyPress = $true; & $go }
+    elseif ($e.KeyCode -eq "Escape") { $e.SuppressKeyPress = $true; $tb.Text = ""; $tb.Focus() }
+})
 $btn.Add_Click($go); $lb.Add_DoubleClick($go)
+$f.Add_Shown({ $tb.Focus() })
 Fill
 [void]$f.ShowDialog()
