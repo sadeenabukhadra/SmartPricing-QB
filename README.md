@@ -44,7 +44,7 @@ PriceRecall reads your sales history through the official QuickBooks SDK and tur
 
 - Every important customer gets a **personal per-item price level** named `LP <customer name>` holding the last price they paid for each item.
 - That level is **linked to the customer**, so when you pick the customer on a new invoice, QuickBooks itself fills every item with that customer's last price. There is no add-on to open and nothing to copy.
-- Customers outside the top list are served on demand from a small **"Prepare customer" window**, which loads their prices into one of 12 rotating levels in one click.
+- **Every other customer with at least one sale** (inactive customers, customers with another price level and generic cash customers included) is served on demand from a small **"Prepare customer" window**, which loads their prices into one of 12 rotating levels in one click.
 - The window also shows the customer's **last discount %** and copies `Discount 15%` to the clipboard, ready to paste into the invoice Memo.
 
 Prices are stored **before discount** (the Rate on the invoice line). The discount is added as a separate Discount line, exactly as the accountant already does.
@@ -131,8 +131,18 @@ Run **`apply-all.bat`** and type `YES`. On the first run this creates up to ~84 
 
 Run **`prepare.bat`**. A small window opens:
 
-- Type part of the name in the search box. Customers marked **`[automatic]`** already have a fixed level, so you can go straight to the invoice.
-- Select the customer and click **Prepare** (or double-click).
+- Type **any part of the name**: one letter, one word, or several words in any order. Search ignores upper/lower case and Arabic spelling variants (أ/إ/آ = ا, ة = ه, ى = ي, ؤ = و, ئ = ي, tashkeel, tatweel, Arabic digits). Names that **start** with the first word are listed first.
+- The list shows every customer with at least one sale, with a tag:
+
+  | Tag | Meaning |
+  |---|---|
+  | `[automatic]` | Has a fixed `LP` level. Go straight to the invoice. |
+  | `[has level: X]` | Uses another price level. Prepare asks **Yes/No** before replacing it. |
+  | `[inactive]` | Inactive in QuickBooks. Prepare works, but make the customer active before invoicing. |
+  | *(no tag)* | Needs Prepare. |
+
+- The line under the list shows the number of items, the last discount and the status of the selected customer.
+- Keyboard: **Up/Down** move in the list while typing, **Enter** = Prepare, **Esc** = clear the search. Double-click also prepares.
 - The status line shows `READY: '<customer>' -> LPX 03 (57 items). Open a new invoice now.`
 - If the customer had a discount last time, `Discount 15%` is **already on the clipboard**. Paste it into the invoice Memo with **Ctrl+V** and add the Discount line.
 
@@ -174,7 +184,7 @@ Everything is written to **`Desktop\LastPrice\`**. These files contain customer 
 |---|---|---|
 | `plan-YYYYMMDD-HHMM.csv` | every run | Full plan: customer, status, price level, action, item, unit of measure, last price, net price, discount %, date, document number, previous price, times sold |
 | `last-prices.csv` | full runs | Lookup list for every active customer, including those without a level (`AutoInInvoice = YES/blank`) |
-| `cache-lastprices.csv` | full runs | Data used by the `prepare` window |
+| `cache-lastprices.csv` | full runs | Data used by the `prepare` window: every customer with sales, with `Fixed` = `YES` / `OTHER` / `INACTIVE` / blank and `OtherLevel` |
 | `run-YYYYMMDD-HHMM.txt` | every run | Log of what was read, planned and written |
 | `backup-levels-*.csv` | `-Apply` | Every `LP` level price **before** the change |
 | `backup-customer-links-*.csv` | `-Apply` | Which customer was linked to which level **before** the change |
@@ -212,11 +222,11 @@ Everything is written to **`Desktop\LastPrice\`**. These files contain customer 
 - **Dry run by default.** Nothing is written unless you pass `-Apply`.
 - **File lock.** With `-Apply`, the open company file must match `-AllowFile` exactly, or nothing is written.
 - **Explicit confirmation.** The tool asks you to type `YES` before writing.
-- **Your own price levels are never touched.** Customers who already have a price level that does not start with `LP ` or `LPX ` are skipped.
+- **Your own price levels are never touched automatically.** The nightly run skips customers who have a price level that does not start with `LP ` or `LPX `. Only `prepare` can replace it, and only after the accountant answers **Yes**.
 - **Prices are never removed.** Updating a level adds and changes prices but never deletes an item from it.
 - **Backups before every write**, with the previous prices and customer links saved to CSV.
 - **Limit check.** If the result would exceed 99 levels, the run stops before writing.
-- **Inactive items and customers are skipped**, and so are generic cash customers.
+- **Inactive items are skipped.** Inactive and generic cash customers never get a fixed `LP` level; they can only be prepared on demand.
 
 ---
 
@@ -255,7 +265,9 @@ QuickBooks must be open, and no one should be editing a customer or a price leve
 | `could not write last-prices.csv` | The file is open in Excel | Close Excel and run again |
 | `Missing ...cache-lastprices.csv` in prepare | The nightly run has not run yet on this PC | Run `dryrun.bat` or `apply-all.bat` once |
 | Invoice doesn't fill the last price | Customer not linked, or the item was not sold to them before | Run `prepare` for the customer and check the *Price Level* field on the customer |
-| `SKIP: already has price level '...'` in the plan | The customer uses one of your own levels | Intended. Clear it on the customer if you want the tool to manage them. |
+| `SKIP: already has price level '...'` in the plan | The customer uses one of your own levels | Intended. In `prepare` the customer shows `[has level: ...]` and can be prepared after answering Yes. |
+| `could not link the customer ... The list element is in use` in prepare | The customer is open in an *Edit Customer* window in QuickBooks | Close that window (Cancel) and press Prepare again |
+| A customer is missing from prepare | No sale since `-FromDate`, or the nightly run has not run since the change | Run `apply-all.bat` (or `dryrun.bat`) once |
 
 ---
 
@@ -265,7 +277,8 @@ QuickBooks must be open, and no one should be editing a customer or a price leve
 - **One price per item per level.** If a customer buys the same item in different units of measure, the plan marks `MixedUM = YES` and the price of the most recent unit is used.
 - **Discounts are not filled automatically.** QuickBooks price levels hold prices only. The discount % is shown and copied for the accountant.
 - **Level names** are limited to 31 characters, so long customer names are shortened (and `~2`, `~3` is added if two names collide).
-- The prices are as fresh as the **last nightly run**. Prepare uses the same nightly cache.
+- The prices are as fresh as the **last nightly run**. Prepare uses the same nightly cache, so the tags in the list are also from that run (Prepare itself always checks the customer live in QuickBooks).
+- Customers who **never bought anything** do not appear in `prepare`, because they have no last price.
 
 ---
 
