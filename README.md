@@ -44,7 +44,7 @@ PriceRecall reads your sales history through the official QuickBooks SDK and tur
 
 - Every important customer gets a **personal per-item price level** named `LP <customer name>` holding the last price they paid for each item.
 - That level is **linked to the customer**, so when you pick the customer on a new invoice, QuickBooks itself fills every item with that customer's last price. There is no add-on to open and nothing to copy.
-- **Every other customer with at least one sale** (inactive customers, customers with another price level and generic cash customers included) is served on demand from a small **"Prepare customer" window**, which loads their prices into one of 12 rotating levels in one click.
+- **Every other customer with at least one sale** (customers with another price level and generic cash customers included; inactive customers are hidden) is served on demand from a small **"Prepare customer" window**, which loads their prices into one of 12 rotating levels in one click.
 - The window also shows the customer's **last discount %** and copies `Discount 15%` to the clipboard, ready to paste into the invoice Memo.
 
 Prices are stored **before discount** (the Rate on the invoice line). The discount is added as a separate Discount line, exactly as the accountant already does.
@@ -132,13 +132,12 @@ Run **`apply-all.bat`** and type `YES`. On the first run this creates up to ~84 
 Run **`prepare.bat`**. A small window opens:
 
 - Type **any part of the name**: one letter, one word, or several words in any order. Search ignores upper/lower case and Arabic spelling variants (أ/إ/آ = ا, ة = ه, ى = ي, ؤ = و, ئ = ي, tashkeel, tatweel, Arabic digits). Names that **start** with the first word are listed first.
-- The list shows every customer with at least one sale, with a tag:
+- The list shows every **active** customer with at least one sale (inactive customers are hidden), with a tag:
 
   | Tag | Meaning |
   |---|---|
   | `[automatic]` | Has a fixed `LP` level. Go straight to the invoice. |
   | `[has level: X]` | Uses another price level. Prepare asks **Yes/No** before replacing it. |
-  | `[inactive]` | Inactive in QuickBooks. Prepare works, but make the customer active before invoicing. |
   | *(no tag)* | Needs Prepare. |
 
 - The line under the list shows the number of items, the last discount and the status of the selected customer.
@@ -267,7 +266,7 @@ QuickBooks must be open, and no one should be editing a customer or a price leve
 | Invoice doesn't fill the last price | Customer not linked, or the item was not sold to them before | Run `prepare` for the customer and check the *Price Level* field on the customer |
 | `SKIP: already has price level '...'` in the plan | The customer uses one of your own levels | Intended. In `prepare` the customer shows `[has level: ...]` and can be prepared after answering Yes. |
 | `could not link the customer ... The list element is in use` in prepare | The customer is open in an *Edit Customer* window in QuickBooks | Close that window (Cancel) and press Prepare again |
-| A customer is missing from prepare | No sale since `-FromDate`, or the nightly run has not run since the change | Run `apply-all.bat` (or `dryrun.bat`) once |
+| A customer is missing from prepare | Customer is inactive (hidden), no sale since `-FromDate`, or the nightly run has not run since the change | Run `apply-all.bat` (or `dryrun.bat`) once |
 
 ---
 
