@@ -1,6 +1,8 @@
 # prepare.ps1 - "Prepare customer" button for customers WITHOUT a fixed price level.
 # The accountant picks a customer -> the tool puts that customer's last prices into one of the
 # rotating price levels ("LPX 01".."LPX 12", least recently used) and links it to the customer.
+# v5: price levels are never deleted (QuickBooks 2011 keeps counting deleted ones against its limit);
+# an existing level is renamed and refilled instead.
 # Then a new invoice for that customer auto-fills the last prices (BEFORE discount).
 # The window also shows the customer's last discount % and copies "Discount xx%" to the clipboard,
 # so the accountant pastes it into the invoice Memo (Ctrl+V) and adds the Discount line.
@@ -18,7 +20,13 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $dir = Join-Path ([Environment]::GetFolderPath("Desktop")) "LastPrice"
-$cacheFile = Join-Path $dir "cache-lastprices.csv"
+if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+# cache: the newest of  <company file folder>\LastPrice\cache-lastprices.csv  (shared copy written by the nightly run on the server)
+#        and            Desktop\LastPrice\cache-lastprices.csv                 (local run)
+$cands = @((Join-Path $dir "cache-lastprices.csv"))
+if ($AllowFile) { $cands += (Join-Path (Join-Path (Split-Path $AllowFile -Parent) "LastPrice") "cache-lastprices.csv") }
+$cacheFile = ($cands | Where-Object { Test-Path $_ } | Sort-Object { (Get-Item $_).LastWriteTime } -Descending | Select-Object -First 1)
+if (-not $cacheFile) { $cacheFile = $cands[-1] }
 $logFile = Join-Path $dir "prepare-log.txt"
 function Log($t) { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $t" | Out-File -FilePath $logFile -Append -Encoding UTF8 }
 function Esc($s) { [Security.SecurityElement]::Escape([string]$s) }
@@ -49,7 +57,7 @@ function Norm($s) {
 
 $cache = Import-Csv $cacheFile
 $byCust = @{}; foreach ($r in $cache) { if (-not $byCust.ContainsKey($r.CustId)) { $byCust[$r.CustId] = New-Object System.Collections.ArrayList }; [void]$byCust[$r.CustId].Add($r) }
-$names = $byCust.Keys | ForEach-Object {
+$names = $byCust.Keys | Where-Object { $byCust[$_][0].Fixed -ne "INACTIVE" } | ForEach-Object {   # inactive customers are hidden
     $r = $byCust[$_][0]
     # last discount = discount on the customer's most recent sale (if the cache has the column)
     $lastRow = $byCust[$_] | Sort-Object { $_.Date } | Select-Object -Last 1
@@ -74,9 +82,11 @@ function Prepare-Customer($cust) {
         $file = $rp.GetCurrentCompanyFileName($ticket)
         if ($AllowFile -and $file -ne $AllowFile) { return "STOP: open company file is '$file', not '$AllowFile'. Nothing changed." }
 
-        # rotating levels
-        $rs = Send "<PriceLevelQueryRq><ActiveStatus>All</ActiveStatus><NameFilter><MatchCriterion>StartsWith</MatchCriterion><Name>LPX </Name></NameFilter></PriceLevelQueryRq>"
-        $lpx = @($rs.SelectNodes("PriceLevelRet") | ForEach-Object { [pscustomobject]@{ ListID = (T $_ "ListID"); Name = (T $_ "Name"); Modified = (T $_ "TimeModified") } })
+        # rotating levels (LPX nn) and spare levels left by the nightly run (LP ~spare nn), with their items
+        $rs = Send "<PriceLevelQueryRq><ActiveStatus>All</ActiveStatus></PriceLevelQueryRq>"
+        $lvAll = @($rs.SelectNodes("PriceLevelRet") | ForEach-Object { [pscustomobject]@{ ListID = (T $_ "ListID"); Name = (T $_ "Name"); EditSeq = (T $_ "EditSequence"); Modified = (T $_ "TimeModified"); Items = @($_.SelectNodes("PriceLevelPerItemRet") | ForEach-Object { T $_ "ItemRef/ListID" }) } })
+        $lpx = @($lvAll | Where-Object { $_.Name.StartsWith("LPX ") })
+        $spares = @($lvAll | Where-Object { $_.Name -like "LP ~spare*" } | Sort-Object Name)
 
         # all customers' links (to find who uses which LPX level)
         $rs = Send "<CustomerQueryRq><ActiveStatus>All</ActiveStatus><IncludeRetElement>ListID</IncludeRetElement><IncludeRetElement>FullName</IncludeRetElement><IncludeRetElement>EditSequence</IncludeRetElement><IncludeRetElement>PriceLevelRef</IncludeRetElement></CustomerQueryRq>"
@@ -86,36 +96,54 @@ function Prepare-Customer($cust) {
         if ($me.PLName -and $me.PLName.StartsWith("LP ")) { return "'$($me.Name)' already has a fixed price level ($($me.PLName)). Nothing to do - just open the invoice." }
         if ($me.PLName -and -not $me.PLName.StartsWith("LPX ")) { $ans = [Windows.Forms.MessageBox]::Show($f, "'$($me.Name)' has the price level '$($me.PLName)'.`nReplace it with this customer's last prices?", "Last Price", [Windows.Forms.MessageBoxButtons]::YesNo, [Windows.Forms.MessageBoxIcon]::Question); if ($ans -ne [Windows.Forms.DialogResult]::Yes) { return "'$($me.Name)' keeps its price level ($($me.PLName)). Not changed." }; Log "replacing level '$($me.PLName)' on '$($me.Name)'"; $me.PLName = ""; $me.PLId = "" }
 
-        # choose slot: own LPX -> new LPX (if fewer than $Rotating) -> least recently used
-        $slot = $null; $slotName = ""
-        if ($me.PLName) { $slot = $lpx | Where-Object { $_.ListID -eq $me.PLId } | Select-Object -First 1 }
-        if (-not $slot -and $lpx.Count -lt $Rotating) {
-            for ($n = 1; $n -le $Rotating; $n++) { $nm = "LPX {0:D2}" -f $n; if (-not ($lpx | Where-Object { $_.Name -eq $nm })) { $slotName = $nm; break } }
-        }
-        if (-not $slot -and -not $slotName) { $slot = $lpx | Sort-Object Modified | Select-Object -First 1 }
-        if ($slot) { $slotName = $slot.Name }
+        # NOTE: QuickBooks 2011 keeps counting DELETED price levels against its list limit,
+        # so levels are never deleted here: an existing level is renamed and refilled instead.
+        $rows = $byCust[$cust.Id]
+        $newIds = @{}; foreach ($x in $rows) { $newIds[$x.ItemId] = 1 }
+        $cur = if ($cust.CurId) { "<CurrencyRef><ListID>$($cust.CurId)</ListID></CurrencyRef>" } else { "" }
+        $per = ($rows | ForEach-Object { "<PriceLevelPerItem><ItemRef><ListID>$($_.ItemId)</ListID></ItemRef><CustomPrice>$($_.Price)</CustomPrice></PriceLevelPerItem>" }) -join ""
 
-        if ($slot) {
-            # unlink every customer that uses this slot, then delete it (so no old prices stay in it)
-            foreach ($u in ($all | Where-Object { $_.PLId -eq $slot.ListID })) {
+        # unlink every OTHER customer that uses a level. Returns "" or an error text.
+        function Free-Slot($sl) {
+            foreach ($u in ($all | Where-Object { $_.PLId -eq $sl.ListID -and $_.ListID -ne $me.ListID })) {
                 $ok = $false
                 foreach ($empty in @("<FullName></FullName>", "<ListID></ListID>")) {
                     $r2 = Send "<CustomerModRq><CustomerMod><ListID>$($u.ListID)</ListID><EditSequence>$($u.EditSeq)</EditSequence><PriceLevelRef>$empty</PriceLevelRef></CustomerMod></CustomerModRq>"
-                    if ([int]$r2.statusCode -eq 0) { $ok = $true; if ($u.ListID -eq $me.ListID) { $me.EditSeq = T $r2 "CustomerRet/EditSequence" }; break }
+                    if ([int]$r2.statusCode -eq 0) { $ok = $true; $u.PLId = ""; break }
                 }
-                if (-not $ok) { Log "FAIL unlink $($u.Name) from $slotName : $($r2.statusMessage)"; return "Could not free $slotName from '$($u.Name)': $($r2.statusMessage). Nothing else changed." }
-                Log "unlinked '$($u.Name)' from $slotName"
+                if (-not $ok) { Log "FAIL unlink $($u.Name) from $($sl.Name) : $($r2.statusMessage)"; return "Could not free $($sl.Name) from '$($u.Name)': $($r2.statusMessage). Nothing else changed." }
+                Log "unlinked '$($u.Name)' from $($sl.Name)"
             }
-            $r2 = Send "<ListDelRq><ListDelType>PriceLevel</ListDelType><ListID>$($slot.ListID)</ListID></ListDelRq>"
-            if ([int]$r2.statusCode -ne 0) { Log "FAIL delete $slotName : $($r2.statusMessage)"; return "Could not reset $slotName : $($r2.statusMessage)" }
+            return ""
         }
+        # refill an existing level with this customer's prices (and rename it); old items fall back to the normal price (0%)
+        function Load-Slot($sl, $newName) {
+            $old = ($sl.Items | Where-Object { $_ -and -not $newIds.ContainsKey($_) } | ForEach-Object { "<PriceLevelPerItem><ItemRef><ListID>$_</ListID></ItemRef><CustomPricePercent>0</CustomPricePercent></PriceLevelPerItem>" }) -join ""
+            $nm = if ($newName -ne $sl.Name) { "<Name>$(Esc $newName)</Name>" } else { "" }
+            return (Send "<PriceLevelModRq><PriceLevelMod><ListID>$($sl.ListID)</ListID><EditSequence>$($sl.EditSeq)</EditSequence>$nm$per$old$cur</PriceLevelMod></PriceLevelModRq>")
+        }
+        function Free-LpxName() { for ($n = 1; $n -le 99; $n++) { $nm = "LPX {0:D2}" -f $n; if (-not ($lvAll | Where-Object { $_.Name -eq $nm })) { return $nm } }; return "LPX 99" }
 
-        # create the slot with this customer's last prices and link it
-        $rows = $byCust[$cust.Id]
-        $per = ($rows | ForEach-Object { "<PriceLevelPerItem><ItemRef><ListID>$($_.ItemId)</ListID></ItemRef><CustomPrice>$($_.Price)</CustomPrice></PriceLevelPerItem>" }) -join ""
-        $cur = if ($cust.CurId) { "<CurrencyRef><ListID>$($cust.CurId)</ListID></CurrencyRef>" } else { "" }
-        $r2 = Send "<PriceLevelAddRq><PriceLevelAdd><Name>$(Esc $slotName)</Name><IsActive>true</IsActive>$per$cur</PriceLevelAdd></PriceLevelAddRq>"
-        if ([int]$r2.statusCode -ne 0) { Log "FAIL add $slotName : $($r2.statusMessage)"; return "Could not create $slotName : $($r2.statusMessage)" }
+        $slot = $null; $slotName = ""; $r2 = $null
+        # 1) the customer's own LPX level -> refill it
+        if ($me.PLName) { $slot = $lpx | Where-Object { $_.ListID -eq $me.PLId } | Select-Object -First 1 }
+        if ($slot) { $slotName = $slot.Name; $r2 = Load-Slot $slot $slotName }
+        # 2) fewer than $Rotating LPX levels -> try a NEW level (QuickBooks may refuse: list limit)
+        if ($null -eq $r2 -and $lpx.Count -lt $Rotating) {
+            $slotName = Free-LpxName
+            $r2 = Send "<PriceLevelAddRq><PriceLevelAdd><Name>$(Esc $slotName)</Name><IsActive>true</IsActive>$per$cur</PriceLevelAdd></PriceLevelAddRq>"
+            if ([int]$r2.statusCode -ne 0) { Log "QuickBooks refused new level $slotName ($($r2.statusMessage)); price levels in file: $($lvAll.Count). Reusing an existing level."; $r2 = $null }
+        }
+        # 3) reuse: a spare level from the nightly run (renamed to LPX nn), otherwise the least recently used LPX
+        if ($null -eq $r2) {
+            if ($spares.Count -gt 0) { $slot = $spares[0]; $slotName = Free-LpxName }
+            else { $slot = $lpx | Sort-Object Modified | Select-Object -First 1; if ($slot) { $slotName = $slot.Name } }
+            if (-not $slot) { return "No price level available (QuickBooks list is full and there is no LPX level to reuse)." }
+            $e = Free-Slot $slot; if ($e) { return $e }
+            $r2 = Load-Slot $slot $slotName
+            Log "reused '$($slot.Name)' as $slotName"
+        }
+        if ([int]$r2.statusCode -ne 0) { Log "FAIL load $slotName : $($r2.statusMessage)"; return "Could not load prices into $slotName : $($r2.statusMessage)" }
         $plId = T $r2 "PriceLevelRet/ListID"
         $r3 = Send "<CustomerModRq><CustomerMod><ListID>$($me.ListID)</ListID><EditSequence>$($me.EditSeq)</EditSequence><PriceLevelRef><ListID>$plId</ListID></PriceLevelRef></CustomerMod></CustomerModRq>"
         if ([int]$r3.statusCode -ne 0) { Log "FAIL link $($me.Name) : $($r3.statusMessage)"; return "Prices loaded but could not link the customer: $($r3.statusMessage)" }
