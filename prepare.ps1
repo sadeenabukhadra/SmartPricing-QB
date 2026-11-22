@@ -1,4 +1,4 @@
-# prepare.ps1 - "Prepare customer" button for customers WITHOUT a fixed price level.
+﻿# prepare.ps1 - "Prepare customer" button for customers WITHOUT a fixed price level.
 # The accountant picks a customer -> the tool puts that customer's last prices into one of the
 # rotating price levels ("LPX 01".."LPX 12", least recently used) and links it to the customer.
 # v5: price levels are never deleted (QuickBooks 2011 keeps counting deleted ones against its limit);
@@ -144,6 +144,14 @@ function Prepare-Customer($cust) {
             Log "reused '$($slot.Name)' as $slotName"
         }
         if ([int]$r2.statusCode -ne 0) { Log "FAIL load $slotName : $($r2.statusMessage)"; return "Could not load prices into $slotName : $($r2.statusMessage)" }
+        if ((T $r2 "PriceLevelRet/IsActive") -eq "false") {
+            # make the level active (separate request: QuickBooks 2011 refuses IsActive together with price changes)
+            $seq = T $r2 "PriceLevelRet/EditSequence"
+            $ra = Send "<PriceLevelModRq><PriceLevelMod><ListID>$(T $r2 "PriceLevelRet/ListID")</ListID><EditSequence>$seq</EditSequence><IsActive>true</IsActive></PriceLevelMod></PriceLevelModRq>"
+            if ([int]$ra.statusCode -ne 0) { $ra = Send "<PriceLevelModRq><PriceLevelMod><ListID>$(T $r2 "PriceLevelRet/ListID")</ListID><EditSequence>$seq</EditSequence><IsActive>1</IsActive></PriceLevelMod></PriceLevelModRq>" }
+            Log "activate $slotName : status $($ra.statusCode) $($ra.statusMessage)"
+            if ([int]$ra.statusCode -eq 0) { $r2 = $ra }
+        }
         $plId = T $r2 "PriceLevelRet/ListID"
         $r3 = Send "<CustomerModRq><CustomerMod><ListID>$($me.ListID)</ListID><EditSequence>$($me.EditSeq)</EditSequence><PriceLevelRef><ListID>$plId</ListID></PriceLevelRef></CustomerMod></CustomerModRq>"
         if ([int]$r3.statusCode -ne 0) { Log "FAIL link $($me.Name) : $($r3.statusMessage)"; return "Prices loaded but could not link the customer: $($r3.statusMessage)" }
