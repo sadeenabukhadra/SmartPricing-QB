@@ -8,6 +8,7 @@
 ![QuickBooks](https://img.shields.io/badge/QuickBooks-Enterprise%2011.0%20(2011)-2CA01C)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20(32--bit)-5391FE)
 ![qbXML](https://img.shields.io/badge/SDK-qbXML%2010.0-orange)
+![Version](https://img.shields.io/badge/version-5.3-blue)
 
 </div>
 
@@ -31,6 +32,7 @@
 14. [Troubleshooting](#troubleshooting)
 15. [Known limitations](#known-limitations)
 16. [Repository layout](#repository-layout)
+17. [Changelog](#changelog)
 
 ---
 
@@ -75,7 +77,7 @@ flowchart LR
    - unlinks and deletes `LP` levels of customers who **dropped out** of the top list (this frees slots first),
    - creates or updates the `LP` level for each top customer, adding new prices and never removing an existing item,
    - links the level to the customer.
-6. **Prepare** (during the day). For a customer without a fixed level, the accountant picks the name in `prepare.bat`. The tool takes the least recently used `LPX` slot, clears it, fills it with this customer's last prices and links it. The next invoice for that customer fills automatically.
+6. **Prepare** (during the day). For a customer without a fixed level, the accountant picks the name in `prepare.bat`. The tool takes a free `LPX` slot (or the least recently used one), clears it, fills it with this customer's last prices and links it. If QuickBooks refuses a new slot because its list is full, the tool recycles the oldest `LPX` slot instead, so Prepare always works. The next invoice for that customer fills automatically.
 
 ---
 
@@ -97,10 +99,12 @@ flowchart LR
 ## Installation
 
 1. **Download** this repository (green **Code** button > **Download ZIP**) and extract it to a folder, for example `C:\PriceRecall\`. Keep all files together.
-2. **Set the company file path.** Open `apply-all.bat`, `apply-one.bat` and `prepare.bat` in Notepad and replace the path after `-AllowFile` with the **exact** path of your company file. To find it, press **F2** (or **Ctrl+1**) in QuickBooks and copy the *Location* field.
+2. **Set the company file path.** All `.bat` files read it from **`settings.bat`**, the only file you edit. Open QuickBooks on the company file and double-click **`set-path.bat`**: it asks QuickBooks for the open file and writes it into `settings.bat` (if that fails, it takes the `Company file:` line from the latest dry-run log). You can also edit it by hand:
    ```bat
-   -AllowFile "C:\Path\To\YourCompany.qbw"
+   set "QBFILE=D:\QuickBooksData\YourCompany.qbw"
+   set "NIGHTLY_TIME=23:30"
    ```
+   Use the path **as seen on that PC** (a server path like `D:\...` on the server, a network path like `\\server\share\...` on a workstation).
 3. **Authorise the tool once.** Open QuickBooks as Admin, then run in the 32-bit PowerShell:
    ```powershell
    C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -File probe.ps1
@@ -121,7 +125,7 @@ The tool reads everything, builds the plan and writes it to `Desktop\LastPrice\p
 
 ### 2. Try one customer
 
-Edit the customer name after `-OnlyCustomer` in **`apply-one.bat`**, then run it. Type `YES` when asked. Only that customer is touched. Create a test invoice for the customer and check that the prices fill in.
+Run **`apply-one.bat`** and type the customer's full name when asked. Type `YES` when asked. Only that customer is touched. Create a test invoice for the customer and check that the prices fill in.
 
 ### 3. Apply to all customers
 
@@ -202,7 +206,7 @@ Everything is written to **`Desktop\LastPrice\`**. These files contain customer 
 | `-OnlyCustomer` | *(empty)* | Process only this customer (full name). Never touches other customers. |
 | `-FromDate` | `2021-01-01` | Read sales from this date (`yyyy-MM-dd`) |
 | `-ActiveDays` | `365` | A customer needs a sale in this many days to get a fixed level. Also the window used for ranking. |
-| `-MaxLevels` | `99` | QuickBooks price level limit |
+| `-MaxLevels` | `100` | QuickBooks price level limit (warning only) |
 | `-Rotating` | `12` | Number of `LPX` slots reserved for `prepare` |
 | `-ExcludeCustomers` | `Cash Van`, `Cash Sales`, `Samples Marketing` | Generic customers that never get a level |
 | `-NetPrice` | off | Old mode: store the price **after** discount instead of before |
@@ -224,22 +228,20 @@ Everything is written to **`Desktop\LastPrice\`**. These files contain customer 
 - **Your own price levels are never touched automatically.** The nightly run skips customers who have a price level that does not start with `LP ` or `LPX `. Only `prepare` can replace it, and only after the accountant answers **Yes**.
 - **Prices are never removed.** Updating a level adds and changes prices but never deletes an item from it.
 - **Backups before every write**, with the previous prices and customer links saved to CSV.
-- **Limit check.** If the result would exceed 99 levels, the run stops before writing.
+- **Limit check.** If the result would exceed 99 levels, the run stops before writing. If QuickBooks still refuses a level, fixed customers win: one `LPX` slot is freed and the add is retried once.
 - **Inactive items are skipped.** Inactive and generic cash customers never get a fixed `LP` level; they can only be prepared on demand.
 
 ---
 
 ## Scheduling the nightly run
 
-Use **Windows Task Scheduler** on the PC that keeps QuickBooks open on the company file:
+Run **`install-nightly.bat`** once on the PC (or server) that keeps QuickBooks open on the company file. It creates the Windows task **"PriceRecall Nightly"**, which starts `nightly.bat` every day at `NIGHTLY_TIME` from `settings.bat`. `nightly.bat` runs `lastprice.ps1 -Apply -Yes`, so no `YES` prompt is needed.
 
-1. *Create Task* > **Triggers**: Daily, e.g. 02:00.
-2. **Actions**: Start a program
-   - Program: `C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe`
-   - Arguments: `-ExecutionPolicy Bypass -File "C:\PriceRecall\lastprice.ps1" -Apply -AllowFile "C:\Path\To\YourCompany.qbw"`
-3. **General**: *Run only when user is logged on* (QuickBooks must be open in the same session).
-
-> **Note:** the script asks for `YES` before writing, which is intended for manual runs. For an unattended nightly task, that prompt must be answered automatically or removed for scheduled runs. Test the scheduled task once while watching it.
+- Do **not** run it as Administrator ("Run as administrator"): an elevated task cannot talk to the normal QuickBooks window and fails with *multiple instances of QuickBooks*.
+- The Windows user must stay **logged in** (disconnect Remote Desktop, never sign out).
+- Recommended: schedule the QuickBooks backup half an hour before the nightly run (e.g. 23:00 backup, 23:30 nightly).
+- Remove the task with **`uninstall-nightly.bat`**.
+- Each run writes `Desktop\LastPrice\run-YYYYMMDD-HHMM.txt`, and copies the cache to `<company file folder>\LastPrice\` so `prepare` on other PCs gets fresh data.
 
 QuickBooks must be open, and no one should be editing a customer or a price level at that moment.
 
@@ -248,7 +250,7 @@ QuickBooks must be open, and no one should be editing a customer or a price leve
 ## Undo and recovery
 
 - **Restore a QuickBooks backup.** This is the cleanest option and the reason to back up before the first live run.
-- **Remove everything the tool created.** Delete the price levels whose names start with `LP ` and `LPX ` (Lists > Price Level List). QuickBooks clears the link on the customers automatically.
+- **Remove everything the tool created.** Delete the price levels whose names start with `LP ` and `LPX ` (Lists > Price Level List). QuickBooks clears the link on the customers automatically. Note: deleted levels keep counting against the QuickBooks 2011 limit, so new ones may not be creatable afterwards.
 - **Restore old prices.** The `backup-levels-*.csv` and `backup-customer-links-*.csv` files record the state before each run.
 
 ---
@@ -260,7 +262,9 @@ QuickBooks must be open, and no one should be editing a customer or a price leve
 | `ERROR: run with 32-bit PowerShell` | Started from the normal 64-bit PowerShell | Use the `.bat` files or the `SysWOW64` path |
 | `Could not start QuickBooks` / access denied | Tool not authorised, or QuickBooks not open | Open QuickBooks as Admin and run `probe.ps1` again. Check *Edit > Preferences > Integrated Applications*. |
 | `STOP: -AllowFile does not match` | Another company file is open, or the path differs | Copy the exact *Location* from F2 into the `.bat` file |
-| Error **3180** when adding a level | The 99-level limit was reached | Delete unused price levels or lower `-Rotating` |
+| `You have exceeded the list limit` / error **3180** when adding a level | The price level list is full (100). "Deleted" levels are only inactive and still count. | Since v5 the tool reuses existing levels instead of creating new ones. **Do not delete price levels by hand**: it does not free space. |
+| `multiple instances of QuickBooks` | The script was started as Administrator, or an extra `QBW32.EXE` is running | End the extra `QBW32.EXE` in Task Manager and start the `.bat` by double-click (not as admin) |
+| Invoice says *"associated with an inactive Price Level"* | The level was reused while inactive | Click **Make it active**. v5.3 activates reused levels automatically. |
 | `could not write last-prices.csv` | The file is open in Excel | Close Excel and run again |
 | `Missing ...cache-lastprices.csv` in prepare | The nightly run has not run yet on this PC | Run `dryrun.bat` or `apply-all.bat` once |
 | Invoice doesn't fill the last price | Customer not linked, or the item was not sold to them before | Run `prepare` for the customer and check the *Price Level* field on the customer |
@@ -272,7 +276,7 @@ QuickBooks must be open, and no one should be editing a customer or a price leve
 
 ## Known limitations
 
-- **99 price levels** in QuickBooks 2011, which is why only the top customers get a fixed level and the rest use the 12 rotating slots.
+- **100 price levels** in QuickBooks 2011 (inactive ones included), which is why only the top customers get a fixed level and the rest use the 12 rotating slots.
 - **One price per item per level.** If a customer buys the same item in different units of measure, the plan marks `MixedUM = YES` and the price of the most recent unit is used.
 - **Discounts are not filled automatically.** QuickBooks price levels hold prices only. The discount % is shown and copied for the accountant.
 - **Level names** are limited to 31 characters, so long customer names are shortened (and `~2`, `~3` is added if two names collide).
@@ -285,16 +289,47 @@ QuickBooks must be open, and no one should be editing a customer or a price leve
 
 ```
 PriceRecall/
-├── lastprice.ps1   Main engine: read, compute, plan, apply
-├── prepare.ps1     "Prepare customer" window (rotating LPX levels)
-├── probe.ps1       Read-only connection test and first authorisation
-├── dryrun.bat      Dry run, writes the plan only
-├── apply-one.bat   Apply for one customer (testing)
-├── apply-all.bat   Apply for all customers (nightly)
-├── prepare.bat     Opens the prepare window (no console)
-├── .gitignore      Keeps customer data out of Git
+├── lastprice.ps1          Main engine: read, compute, plan, apply
+├── prepare.ps1            "Prepare customer" window (rotating LPX levels)
+├── probe.ps1              Read-only connection test and first authorisation
+├── settings.bat           Company file path + nightly time (the only file to edit)
+├── set-path.bat / .ps1    Writes the open company file path into settings.bat
+├── dryrun.bat             Dry run, writes the plan only
+├── apply-one.bat          Apply for one customer (asks for the name)
+├── apply-all.bat          Apply for all customers (asks YES)
+├── nightly.bat            Unattended apply-all (used by the scheduled task)
+├── install-nightly.bat    Creates the "PriceRecall Nightly" Windows task
+├── uninstall-nightly.bat  Removes that task
+├── prepare.bat            Opens the prepare window (no console)
+├── .gitignore             Keeps customer data out of Git
 └── README.md
 ```
 
 > 🔒 **Never commit** the `LastPrice` folder, CSV or Excel exports, or company files (`.qbw`, `.qbb`). They contain customer prices. The `.gitignore` blocks them, but check before you push.
 
+---
+
+## Changelog
+
+**v5.3 (2026-11-22)**
+- Reused levels are made active again with a separate `PriceLevelMod` (QuickBooks 2011 rejects `IsActive` together with price changes, error 3210).
+- A released level that already carries the customer's name is reused first (no `~2` names).
+- No STOP at the limit; `-MaxLevels` default is now 100.
+
+**v5 (2026-11-22)**
+- Found on the live file: in QuickBooks 2011, deleting a price level through the SDK only **makes it inactive**, and inactive levels count against the 100-level limit.
+- Price levels are now **never deleted**. `lastprice.ps1` reuses released `LP` levels by renaming them for new top customers; unused ones are kept as `LP ~spare nn`. If a new level is still refused, an `LPX` level is taken over (renamed), not deleted.
+- `prepare.ps1` refills the customer's own `LPX`, tries a new one, and otherwise renames and refills a `LP ~spare` or the least recently used `LPX`. Items of the previous owner are set back to the normal price (0%).
+
+**v4 (2026-11-22)**
+- `prepare.ps1`: when QuickBooks refuses a new `LPX` level (*You have exceeded the list limit*), the oldest `LPX` slot is recycled instead of failing. The log records how many price levels the file has.
+- `lastprice.ps1`: if adding a fixed `LP` level hits the limit, one `LPX` slot is freed and the add is retried once.
+
+**v3 (2026-11-14)**
+- `settings.bat` + `set-path.bat`: one place for the company file path and nightly time.
+- Unattended nightly run (`nightly.bat`, `-Yes`), `install-nightly.bat` / `uninstall-nightly.bat`.
+- Shared cache next to the company file for `prepare` on other PCs.
+- Price before discount; last discount copied as `Discount xx%` for the Memo.
+
+**v2 (2026-11-11)**
+- Arabic-aware search in `prepare`, all customers listed with tags, inactive customers hidden.
