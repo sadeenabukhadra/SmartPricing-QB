@@ -1,4 +1,4 @@
-# lastprice.ps1 - "Last sold price per customer" tool for QuickBooks Desktop (Enterprise 11.0)
+﻿# lastprice.ps1 - "Last sold price per customer" tool for QuickBooks Desktop (Enterprise 11.0)
 #
 # What it does:
 #   1. READS Invoices + Sales Receipts (from -FromDate to today), Items, Customers, Price Levels.
@@ -106,7 +106,7 @@ try {
         foreach ($pi in $n.SelectNodes("PriceLevelPerItemRet")) {
             $p = T $pi "CustomPrice"; if ($p) { $its[(T $pi "ItemRef/ListID")] = (Num $p) }
         }
-        $lv = [pscustomobject]@{ ListID = (T $n "ListID"); Name = (T $n "Name"); EditSeq = (T $n "EditSequence"); Items = $its }
+        $lv = [pscustomobject]@{ ListID = (T $n "ListID"); Name = (T $n "Name"); EditSeq = (T $n "EditSequence"); Active = ((T $n "IsActive") -ne "false"); Items = $its }
         $levels[$lv.ListID] = $lv; $levelByName[$lv.Name.ToLower()] = $lv
     }
     Log "Price levels in file: $($levels.Count)"
@@ -339,10 +339,19 @@ try {
         $nm = if ($newName -and $newName -ne $lv.Name) { "<Name>$(Esc $newName)</Name>" } else { "" }
         return (Send "<PriceLevelModRq><PriceLevelMod><ListID>$($lv.ListID)</ListID><EditSequence>$($lv.EditSeq)</EditSequence>$nm$per$cur</PriceLevelMod></PriceLevelModRq>")
     }
+    # make an inactive level active (separate request: QuickBooks 2011 refuses IsActive together with price changes)
+    function Activate-Level($id, $seq, $name) {
+        $ra = Send "<PriceLevelModRq><PriceLevelMod><ListID>$id</ListID><EditSequence>$seq</EditSequence><IsActive>true</IsActive></PriceLevelMod></PriceLevelModRq>"
+        if ([int]$ra.statusCode -ne 0) { $ra = Send "<PriceLevelModRq><PriceLevelMod><ListID>$id</ListID><EditSequence>$seq</EditSequence><IsActive>1</IsActive></PriceLevelMod></PriceLevelModRq>" }
+        Log "     activate '$name': status $($ra.statusCode) $(if ([int]$ra.statusCode -ne 0) { $ra.statusMessage })"
+    }
     # 2) create / update levels of the top customers
     foreach ($cp in $ok) {
         $c = $cp.Cust
-        if ($cp.Level -and $cp.Changes -eq 0 -and $c.PLId -eq $cp.Level.ListID) { continue }
+        if ($cp.Level -and $cp.Changes -eq 0 -and $c.PLId -eq $cp.Level.ListID) {
+            if (-not $cp.Level.Active) { Activate-Level $cp.Level.ListID $cp.Level.EditSeq $cp.LevelName }
+            continue
+        }
         # full item list = existing prices + new last prices (never removes an item)
         $prices = @{}
         if ($cp.Level) { foreach ($k in $cp.Level.Items.Keys) { $prices[$k] = $cp.Level.Items[$k] } }
@@ -378,6 +387,7 @@ try {
         if ([int]$rs.statusCode -ne 0) { Log "FAIL level '$($cp.LevelName)' ($($c.Name)): $($rs.statusCode) $($rs.statusMessage)"; $fail++; continue }
         $plId = T $rs "PriceLevelRet/ListID"
         Log ("OK   level '{0}'  items: {1}  changed: {2}" -f $cp.LevelName, $prices.Count, $cp.Changes)
+        if ((T $rs "PriceLevelRet/IsActive") -eq "false") { Activate-Level $plId (T $rs "PriceLevelRet/EditSequence") $cp.LevelName }
         if ($c.PLId -ne $plId) {
             $rs2 = Send "<CustomerModRq><CustomerMod><ListID>$($c.ListID)</ListID><EditSequence>$($c.EditSeq)</EditSequence><PriceLevelRef><ListID>$plId</ListID></PriceLevelRef></CustomerMod></CustomerModRq>"
             if ([int]$rs2.statusCode -ne 0) { Log "FAIL link customer '$($c.Name)': $($rs2.statusCode) $($rs2.statusMessage)"; $fail++; continue }
