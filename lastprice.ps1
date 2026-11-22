@@ -11,7 +11,10 @@
 #
 # Run with 32-bit PowerShell (QuickBooks open on the TEST company file, logged in as Admin):
 #   Dry run :  C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -File lastprice.ps1
-#   Write   :  ... -File lastprice.ps1 -Apply -AllowFile "C:\Users\Lenovo\Desktop\petragate sadeen.qbw" [-OnlyCustomer "Prime Cinema / Irbid"]
+#   Write   :  ... -File lastprice.ps1 -Apply -AllowFile "<exact company file path>" [-OnlyCustomer "Prime Cinema / Irbid"]
+#   Nightly :  ... -File lastprice.ps1 -Apply -AllowFile "<exact company file path>" -Yes
+#              (-Yes skips the YES prompt and opens the company file itself if QuickBooks is not running;
+#               the app must be allowed to log in automatically: Edit > Preferences > Integrated Applications)
 
 param(
     [switch]$Apply,
@@ -19,10 +22,11 @@ param(
     [string]$OnlyCustomer = "",
     [string]$FromDate = "2021-01-01",
     [int]$ActiveDays = 365,
-    [int]$MaxLevels = 99,      # QuickBooks 2011 refused the 100th price level (error 3180)
+    [int]$MaxLevels = 100,     # QuickBooks 2011 price level list limit (live file: 100 levels, then "exceeded the list limit")
     [int]$Rotating = 12,       # "LPX nn" levels kept free for prepare.ps1 (smaller customers, on demand)
     [string[]]$ExcludeCustomers = @("Cash Van", "Cash Sales", "Samples Marketing"),
     [string]$AppName = "Last Price Tool",
+    [switch]$Yes,              # unattended (nightly): no YES prompt; needs -Apply and -AllowFile
     [switch]$NetPrice          # old mode: price AFTER discount. Default now: price BEFORE discount (the line Rate);
                                # the last discount % is listed separately (DiscountPct) for the invoice Memo.
 )
@@ -40,13 +44,19 @@ function Num($s) { if ([string]::IsNullOrEmpty($s)) { return $null }; return [do
 function Fmt($d) { return ([math]::Round($d, 3)).ToString("0.###", $inv) }
 
 if ([Environment]::Is64BitProcess) { Write-Host "ERROR: run with 32-bit PowerShell (C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe)" -ForegroundColor Red; exit 1 }
+if ($Yes -and (-not $Apply -or $AllowFile -eq "")) { Log "STOP: -Yes needs -Apply and -AllowFile. Nothing written."; exit 2 }
+$script:failed = $false
 
 Log "=== Last Price tool  $(Get-Date -Format 'yyyy-MM-dd HH:mm')  mode: $(if ($Apply) {'APPLY (write)'} else {'DRY-RUN (no changes)'}) ==="
 Log "Price: $(if ($NetPrice) {'NET (after discount)'} else {'BEFORE discount (discount % goes in the Memo)'})"
 
 $rp = New-Object -ComObject QBXMLRP2.RequestProcessor
-$rp.OpenConnection2("", $AppName, 1)
-$ticket = $rp.BeginSession("", 2)
+$ticket = $null
+try {
+    $rp.OpenConnection2("", $AppName, 1)
+    # unattended: give QuickBooks the file path so it can open it in the background if nobody has it open on this PC
+    $ticket = $rp.BeginSession($(if ($Yes) { $AllowFile } else { "" }), 2)
+} catch { Log "ERROR: could not connect to QuickBooks: $($_.Exception.Message)"; exit 3 }
 $V = "10.0"
 
 function Send($body) {
@@ -271,8 +281,11 @@ try {
     if ($OnlyCustomer) { $release = @(); $releaseCust = @() }   # single-customer test: never touch other customers
     Log "LP price levels to release (customer left the top list / unused): $($release.Count)   customers to unlink: $($releaseCust.Count)"
     $lpxNow = @($levels.Values | Where-Object { $_.Name.StartsWith("LPX ") }).Count
-    $finalTotal = $levels.Count - $release.Count + $newLv + [math]::Max(0, $Rotating - $lpxNow)
+    # QuickBooks 2011 does NOT give a slot back when a price level is deleted, so levels are never deleted:
+    # released LP levels are reused (renamed) for new top customers.
+    $finalTotal = $levels.Count + [math]::Max(0, $newLv - $release.Count)
     if ($finalTotal -gt $MaxLevels) { Log "WARNING: total price levels would be $finalTotal (> $MaxLevels)." }
+    Log "Price levels now: $($levels.Count)  (LPX: $lpxNow). Released LP levels will be reused, never deleted."
 
     # lookup list for the accountant (all active customers, incl. those without a price level)
     $lookup = $plan | Where-Object { $_.CustomerStatus -eq "OK" -or $_.CustomerStatus -like "LIST ONLY*" } |
@@ -284,6 +297,13 @@ try {
         foreach ($r in $cp.Recs) { if ($items[$r.ItemId].Active) { [pscustomobject]@{ CustId = $cp.Cust.ListID; Customer = $cp.Cust.Name; CurId = $cp.Cust.CurId; Fixed = $(if ($cp.Status -eq "OK") { "YES" } elseif (-not $cp.Cust.Active) { "INACTIVE" } elseif ($cp.Status -like "SKIP: already has price level*") { "OTHER" } else { "" }); OtherLevel = $(if ($cp.Cust.PLName -and -not $cp.Cust.PLName.StartsWith("LP")) { $cp.Cust.PLName } else { "" }); ItemId = $r.ItemId; Item = $items[$r.ItemId].Name; Price = (Fmt $r.Price); DiscPct = (Fmt ($r.Pct * 100)); Date = $r.Date } } }
     }
     try { $cache | Export-Csv -Path (Join-Path $outDir "cache-lastprices.csv") -NoTypeInformation -Encoding UTF8 } catch { Log "WARNING: could not write cache-lastprices.csv" }
+    # shared copy next to the company file, so prepare on other PCs (e.g. the accountant) gets fresh data every night
+    try {
+        $shared = Join-Path (Split-Path $companyFile -Parent) "LastPrice"
+        if (-not (Test-Path $shared)) { New-Item -ItemType Directory -Path $shared | Out-Null }
+        Copy-Item (Join-Path $outDir "cache-lastprices.csv") (Join-Path $shared "cache-lastprices.csv") -Force
+        Log "Shared cache: $shared\cache-lastprices.csv"
+    } catch { Log "WARNING: could not write shared cache next to the company file: $($_.Exception.Message)" }
     $lookupFile = Join-Path $outDir "last-prices.csv"
     try { $lookup | Export-Csv -Path $lookupFile -NoTypeInformation -Encoding UTF8; Log "Lookup list: $lookupFile  ($(@($lookup).Count) rows)" } catch { Log "WARNING: could not write $lookupFile (is it open in Excel?)" }
     }
@@ -291,10 +311,12 @@ try {
     if (-not $Apply) { Log "=== DRY-RUN DONE. Nothing was changed in QuickBooks. ==="; return }
 
     # ---------- APPLY ----------
-    if ($AllowFile -eq "" -or $companyFile -ne $AllowFile) { Log "STOP: -AllowFile does not match the open company file. Nothing written."; return }
-    if ($finalTotal -gt $MaxLevels) { Log "STOP: price level limit. Nothing written."; return }
-    $ans = Read-Host "Release $($release.Count) levels and write $($ok.Count) customers' price levels into '$companyFile'? Type YES to continue"
-    if ($ans -ne "YES") { Log "Cancelled by user. Nothing written."; return }
+    if ($AllowFile -eq "" -or $companyFile -ne $AllowFile) { Log "STOP: -AllowFile does not match the open company file ('$companyFile'). Nothing written."; exit 1 }
+    # no STOP for the limit: released levels are reused and, if QuickBooks refuses a new one, an LPX level is taken over
+    if ($Yes) { Log "Unattended run (-Yes): writing without prompt." } else {
+        $ans = Read-Host "Release $($release.Count) levels and write $($ok.Count) customers' price levels into '$companyFile'? Type YES to continue"
+        if ($ans -ne "YES") { Log "Cancelled by user. Nothing written."; return }
+    }
 
     # backup of current LP levels + customer links (for undo)
     $bk = foreach ($lv in $levels.Values) { if ($lv.Name.StartsWith("LP ")) { foreach ($k in $lv.Items.Keys) { [pscustomobject]@{ PriceLevel = $lv.Name; Item = $items[$k].Name; Price = (Fmt $lv.Items[$k]) } } } }
@@ -302,14 +324,20 @@ try {
     $custs.Values | Where-Object { $_.PLName } | Select-Object Name, PLName | Export-Csv -Path (Join-Path $outDir "backup-customer-links-$stamp.csv") -NoTypeInformation -Encoding UTF8
 
     $done = 0; $fail = 0
-    # 1) release levels of customers that left the top list (frees slots first)
+    # 1) unlink customers that left the top list. Their LP levels go to a reuse pool (NOT deleted:
+    #    QuickBooks 2011 keeps counting deleted price levels against its list limit)
     foreach ($c in $releaseCust) {
         $rs2 = Send "<CustomerModRq><CustomerMod><ListID>$($c.ListID)</ListID><EditSequence>$($c.EditSeq)</EditSequence><PriceLevelRef><FullName></FullName></PriceLevelRef></CustomerMod></CustomerModRq>"
         if ([int]$rs2.statusCode -ne 0) { Log "WARN unlink customer '$($c.Name)': $($rs2.statusCode) $($rs2.statusMessage)" } else { Log "OK   unlinked customer '$($c.Name)' from '$($c.PLName)'" }
     }
-    foreach ($lv in $release) {
-        $rs2 = Send "<ListDelRq><ListDelType>PriceLevel</ListDelType><ListID>$($lv.ListID)</ListID></ListDelRq>"
-        if ([int]$rs2.statusCode -ne 0) { Log "FAIL delete level '$($lv.Name)': $($rs2.statusCode) $($rs2.statusMessage)"; $fail++ } else { Log "OK   deleted level '$($lv.Name)'" }
+    $pool = New-Object System.Collections.ArrayList
+    foreach ($lv in $release) { [void]$pool.Add($lv) }
+    # load prices into an existing level (optionally renamed); items of the old owner fall back to the normal price (0%)
+    function Load-Level($lv, $newName, $prices, $cur) {
+        $per = ($prices.Keys | ForEach-Object { "<PriceLevelPerItem><ItemRef><ListID>$_</ListID></ItemRef><CustomPrice>$(Fmt $prices[$_])</CustomPrice></PriceLevelPerItem>" }) -join ""
+        $per += ($lv.Items.Keys | Where-Object { -not $prices.ContainsKey($_) } | ForEach-Object { "<PriceLevelPerItem><ItemRef><ListID>$_</ListID></ItemRef><CustomPricePercent>0</CustomPricePercent></PriceLevelPerItem>" }) -join ""
+        $nm = if ($newName -and $newName -ne $lv.Name) { "<Name>$(Esc $newName)</Name>" } else { "" }
+        return (Send "<PriceLevelModRq><PriceLevelMod><ListID>$($lv.ListID)</ListID><EditSequence>$($lv.EditSeq)</EditSequence>$nm$per$cur</PriceLevelMod></PriceLevelModRq>")
     }
     # 2) create / update levels of the top customers
     foreach ($cp in $ok) {
@@ -323,8 +351,29 @@ try {
         $cur = if ($c.CurId) { "<CurrencyRef><ListID>$($c.CurId)</ListID></CurrencyRef>" } else { "" }
         if ($cp.Level) {
             $rs = Send "<PriceLevelModRq><PriceLevelMod><ListID>$($cp.Level.ListID)</ListID><EditSequence>$($cp.Level.EditSeq)</EditSequence>$per</PriceLevelMod></PriceLevelModRq>"
+        } elseif ($pool.Count -gt 0) {
+            # reuse a released LP level (rename it) instead of creating a new one
+            # prefer the level that already carries this customer's name (e.g. "LP Xtreme Jordan Club"), so no "~2" name is needed
+            $baseNm = $cp.LevelName -replace ' ~\d+$', ''
+            $old = $pool | Where-Object { $_.Name -eq $baseNm } | Select-Object -First 1
+            if ($old) { $cp.LevelName = $baseNm } else { $old = $pool[0] }
+            $pool.Remove($old)
+            $rs = Load-Level $old $cp.LevelName $prices $cur
+            Log "OK   reused level '$($old.Name)' -> '$($cp.LevelName)' (status $($rs.statusCode))"
         } else {
             $rs = Send "<PriceLevelAddRq><PriceLevelAdd><Name>$(Esc $cp.LevelName)</Name><IsActive>true</IsActive>$per$cur</PriceLevelAdd></PriceLevelAddRq>"
+            if ([int]$rs.statusCode -ne 0) {
+                # list limit: fixed customers come first - take over one "LPX" level (rename it, no delete) and retry
+                $spare = $levels.Values | Where-Object { $_.Name.StartsWith("LPX ") -and -not $_.Gone } | Sort-Object Name -Descending | Select-Object -First 1
+                if ($spare) {
+                    foreach ($u in ($custs.Values | Where-Object { $_.PLId -eq $spare.ListID })) {
+                        $null = Send "<CustomerModRq><CustomerMod><ListID>$($u.ListID)</ListID><EditSequence>$($u.EditSeq)</EditSequence><PriceLevelRef><FullName></FullName></PriceLevelRef></CustomerMod></CustomerModRq>"
+                    }
+                    $spare | Add-Member -NotePropertyName Gone -NotePropertyValue $true -Force
+                    Log "WARN list limit for '$($cp.LevelName)': taking over '$($spare.Name)'"
+                    $rs = Load-Level $spare $cp.LevelName $prices $cur
+                }
+            }
         }
         if ([int]$rs.statusCode -ne 0) { Log "FAIL level '$($cp.LevelName)' ($($c.Name)): $($rs.statusCode) $($rs.statusMessage)"; $fail++; continue }
         $plId = T $rs "PriceLevelRet/ListID"
@@ -336,10 +385,21 @@ try {
         }
         $done++
     }
+    # released levels nobody needed: rename to "LP ~spare nn" (kept for reuse next time, linked to nobody)
+    $sn = 1
+    foreach ($lv in $pool) {
+        if ($lv.Name -like "LP ~spare*") { continue }
+        while ($usedNames.ContainsKey(("LP ~spare {0:D2}" -f $sn).ToLower())) { $sn++ }
+        $nm = "LP ~spare {0:D2}" -f $sn; $usedNames[$nm.ToLower()] = 1
+        $rs2 = Send "<PriceLevelModRq><PriceLevelMod><ListID>$($lv.ListID)</ListID><EditSequence>$($lv.EditSeq)</EditSequence><Name>$nm</Name></PriceLevelMod></PriceLevelModRq>"
+        Log "OK   kept level '$($lv.Name)' as '$nm' (status $($rs2.statusCode))"
+    }
     Log "=== APPLY DONE. customers updated: $done   failures: $fail ==="
+    if ($fail -gt 0) { $script:failed = $true }
 }
-catch { Log "ERROR: $($_.Exception.Message)" }
+catch { Log "ERROR: $($_.Exception.Message)"; $script:failed = $true }
 finally {
-    $rp.EndSession($ticket)
-    $rp.CloseConnection()
+    try { if ($ticket) { $rp.EndSession($ticket) } } catch {}
+    try { $rp.CloseConnection() } catch {}
 }
+if ($script:failed) { exit 1 }
